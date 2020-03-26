@@ -58,10 +58,16 @@ install and enable it yourself."
   :group 'company-dict
   :type 'boolean)
 
+(defcustom company-dict-max-candidates 20
+  "Maximum number of candidates to display in overlay, too many would slow Emacs
+due to high computation in rendering."
+  :group 'company-dict
+  :type 'integer)
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(defvar company-dict-table (make-hash-table :test 'equal)
-  "A lookup hash table that maps major (or minor) modes to lists of completion candidates.")
+(defvar company-dict-dicts nil
+  "A one large list of all merged candidates from all dicts.")
 
 (defun company-dict--read-file (file-path)
   (when (file-exists-p file-path)
@@ -74,33 +80,30 @@ install and enable it yourself."
        (insert-file-contents-literally file-path)
        (buffer-substring-no-properties (point-min) (point-max))) 'utf-8)))
 
-(defun company-dict--relevant-modes ()
-  (append '(all) (parent-mode-list major-mode) company-dict-minor-mode-list))
-
-(defun company-dict--relevant-dicts ()
-  "Merge all dicts together into one large list."
-  (append (gethash 'all company-dict-table)
-          (gethash major-mode company-dict-table)
-          (cl-loop for mode in company-dict-minor-mode-list
-                   if (and (boundp mode)
-                           (symbol-value mode))
-                   nconc (gethash mode company-dict-table))
-          nil))
-
-(defun company-dict--init (mode)
-  "Read dict files and populate dictionary."
+(defun company-dict--get-contents (mode)
+  "Read dict files and populate contents."
   (let (file contents result)
     (unless (symbolp mode)
       (error "Expected symbol, got %s" mode))
-    (unless (gethash mode company-dict-table)
-      (setq file (expand-file-name (symbol-name mode) company-dict-dir)
-            contents (company-dict--read-file file))
-      (when (stringp contents)
-        (puthash mode
-                 (cl-loop for line in (split-string contents "\n" t)
-                          for (label note meta) = (split-string (string-trim-right line) "\t" t)
-                          collect (propertize label :note note :meta meta))
-                 company-dict-table)))
+
+    (setq file (expand-file-name (symbol-name mode) company-dict-dir)
+          contents (company-dict--read-file file))
+    (when (stringp contents)
+      (setq result
+            (cl-loop for line in (split-string contents "\n" t)
+                     for (label note meta) = (split-string (string-trim-right line) "\t" t)
+                     collect (propertize label :note note :meta meta))))
+    result))
+
+(defun company-dict--relevant-modes ()
+  (append '(all) (parent-mode-list major-mode) company-dict-minor-mode-list))
+
+(defun company-dict--init ()
+  (let (list result)
+    (unless company-dict-dicts
+      (setq list (mapcan 'company-dict--get-contents (company-dict--relevant-modes)))
+      (setq company-dict-dicts (vconcat list))
+      (cl-sort company-dict-dicts 'string-lessp))
     result))
 
 (defun company-dict--annotation (data)
@@ -118,30 +121,76 @@ install and enable it yourself."
              (bound-and-true-p yas-minor-mode))
     (yas-expand-snippet data (- (point) (length data)) (point))))
 
+(defun company-dict--binary-search (value sorted-array)
+  (let ((low 0)
+        (high (1- (length sorted-array))))
+
+    (do () ((< high low) nil)
+      (let* ((middle (floor (+ low high) 2))
+             (middle-value (aref sorted-array middle)))
+        (cond ((and (not (string-prefix-p value middle-value))
+                    (string-lessp value middle-value))
+               (setf high (1- middle)))
+
+              ((and (not (string-prefix-p value middle-value))
+                    (not (string-lessp value middle-value)))
+               (setf low (1+ middle)))
+
+              (t (return middle)))))))
+
+(defun company-dict--get-index-first (value sorted-array)
+  (let ((index (company-dict--binary-search value sorted-array))
+        (found nil))
+    (if (and index (> index 0))
+        (progn
+          (while (and (> index 0) (not found))
+            (let ((prev-index-value (aref sorted-array (1- index))))
+              (if (string-prefix-p value prev-index-value)
+                  (setf index (1- index))
+                (setf found t))))
+          index)
+      index)))
+
+(defun company-dict--get-prefix-match (value sorted-array max)
+  (let ((index (company-dict--get-index-first value sorted-array)))
+    (if index
+        (let ((end-index (1+ index))
+              (found nil))
+          (while (and (< end-index (length sorted-array)) (not found))
+            (if (string-prefix-p value (aref sorted-array end-index))
+                (progn
+                  (setf end-index (1+ end-index))
+                  (if (>= (- end-index index) max)
+                      (setf found t)))
+              (setf found t)))
+          (append (cl-subseq sorted-array index end-index) nil))
+      nil)))
+
 ;;;###autoload
 (defun company-dict-refresh ()
   "Refresh all loaded dictionaries."
   (interactive)
-  (let ((modes (hash-table-keys company-dict-table)))
-    (setq company-dict-table (make-hash-table :test 'equal))
-    (mapc 'company-dict--init modes)))
+  (setq company-dict-dicts nil)
+  (company-dict--init))
 
 ;;;###autoload
 (defun company-dict (command &optional arg &rest ignored)
   "`company-mode' backend for user-provided dictionaries. Dictionary files are lazy
 loaded."
   (interactive (list 'interactive))
-  (mapc 'company-dict--init (company-dict--relevant-modes))
-  (let ((dicts (company-dict--relevant-dicts)))
+  (company-dict--init)
+  (let ((dicts company-dict-dicts)
+        (max company-dict-max-candidates))
     (cl-case command
       (interactive     (company-begin-backend 'company-dict))
       (prefix          (and dicts (company-grab-symbol)))
-      (candidates      (cl-remove-if-not
-                        (if company-dict-enable-fuzzy
-                            (lambda (c) (cl-subsetp (string-to-list arg)
-                                               (string-to-list c)))
-                          (lambda (c) (string-prefix-p arg c)))
-                        dicts))
+      (candidates      (if company-dict-enable-fuzzy
+                           (append (cl-remove-if-not
+                                    (lambda (c) (cl-subsetp (string-to-list arg)
+                                                            (string-to-list c)))
+                                    dicts)
+                                   nil)
+                         (company-dict--get-prefix-match arg dicts max)))
       (annotation      (company-dict--annotation arg))
       (meta            (company-dict--meta arg))
       (quickhelp-string (company-dict--quickhelp-string arg))
