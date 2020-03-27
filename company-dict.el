@@ -152,19 +152,30 @@ due to high computation in rendering."
       index)))
 
 (defun company-dict--get-prefix-match (value sorted-array max)
-  (let ((index (company-dict--get-index-first value sorted-array)))
-    (if index
-        (let ((end-index (1+ index))
-              (found nil))
-          (while (and (< end-index (length sorted-array)) (not found))
-            (if (string-prefix-p value (aref sorted-array end-index))
-                (progn
-                  (setf end-index (1+ end-index))
-                  (if (>= (- end-index index) max)
-                      (setf found t)))
-              (setf found t)))
-          (append (cl-subseq sorted-array index end-index) nil))
-      nil)))
+  (let ((prefix-value value)
+        (first-asterisk-index (string-match-p "*" value)))
+
+    (if (and company-dict-enable-fuzzy first-asterisk-index)
+        (setf prefix-value (substring value 0 first-asterisk-index)))
+
+    (let ((index (company-dict--get-index-first prefix-value sorted-array)))
+      (if index
+          (let ((cur-index index)
+                (matched-dict nil)
+                (done nil))
+            (if (and company-dict-enable-fuzzy first-asterisk-index)
+                (setf prefix-value (concat "^" (replace-regexp-in-string "*" ".*" value)))
+              (setf prefix-value (concat "^" value)))
+
+            (while (and (< cur-index (length sorted-array)) (not done))
+              (if (string-match-p prefix-value (aref sorted-array cur-index))
+                  (progn
+                    (push (aref sorted-array cur-index) matched-dict)
+                    (if (>= (length matched-dict) max)
+                        (setf done t))))
+              (setf cur-index (1+ cur-index)))
+            matched-dict)
+        nil))))
 
 ;;;###autoload
 (defun company-dict-refresh ()
@@ -184,13 +195,7 @@ loaded."
     (cl-case command
       (interactive     (company-begin-backend 'company-dict))
       (prefix          (and dicts (company-grab-symbol)))
-      (candidates      (if company-dict-enable-fuzzy
-                           (append (cl-remove-if-not
-                                    (lambda (c) (cl-subsetp (string-to-list arg)
-                                                            (string-to-list c)))
-                                    dicts)
-                                   nil)
-                         (company-dict--get-prefix-match arg dicts max)))
+      (candidates      (company-dict--get-prefix-match arg dicts max))
       (annotation      (company-dict--annotation arg))
       (meta            (company-dict--meta arg))
       (quickhelp-string (company-dict--quickhelp-string arg))
